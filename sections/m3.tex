@@ -1,0 +1,169 @@
+\begin{quote}
+"Inside every large program, there is a small program trying to get out." \\
+\hspace*{\fill} — Tony Hoare
+\end{quote}
+
+\lstset{
+  language=C,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{green!60!black},
+  stringstyle=\color{red},
+  showstringspaces=false,
+  breaklines=true,
+  frame=single,
+}
+
+Milestone 3 encompasses creating new processes and managing their execution. Key tasks include setting up CSpace and VSpace, loading ELF binaries, configuring the dispatcher, and implementing process management features such as spawn, suspend, resume, and kill.
+The implementation covers all core functionalities required for Milestone 3, along with some additional process management tasks. The details are as follows:
+%\setcounter{section}{1}
+\subsection*{Process Spawning}
+\subsubsection*{CSpace Initialization}
+\begin{itemize}
+    \item A two-level CSpace hierarchy is created for the child process. 
+    \item The Level 1 (L1) CNode is initialized using \texttt{cnode\_create\_l1}, and Level 2 (L2) CNodes are set up using \texttt{cnode\_create\_foreign\_l2}.
+    \item  Key slots in the CSpace are populated with capabilities such as the dispatcher, root CNode, page tables, and argument frames, following the conventions specified in the Barrelfish documentation.
+\end{itemize}
+
+\begin{lstlisting}[caption={CSpace creation with L1 and L2 CNodes}, label=lst:cspace_creation]
+errval_t setup_cspace(struct spawninfo *si) {
+    // Create the L1 CNode
+    errval_t err = cnode_create_l1(&si->l1_cnode_cap, &si->l1_cnode_ref);
+    if (err_is_fail(err)) return err;
+
+    // Create L2 CNodes and link them in the L1 CNode
+    for (size_t i = 0; i < ROOTCN_SLOTS_USER; ++i) {
+        err = cnode_create_foreign_l2(si->l1_cnode_cap, i, &si->l2_cnodes[i]);
+        if (err_is_fail(err)) return err;
+    }
+    return SYS_ERR_OK;
+}
+\end{lstlisting}
+
+
+\subsubsection*{VSpace Initialization}
+\begin{itemize}
+    \item A virtual address space (VSpace) is set up for the child process.
+    \item The L0 page table is created using \texttt{vnode\_create}, and mappings for ELF sections are established using \texttt{paging\_map\_fixed\_attr}.
+    \item A default slot allocator is initialized to support subsequent memory allocation for the child.
+\end{itemize}
+
+\begin{lstlisting}[caption={Setting up the VSpace for the child process}, label=lst:vspace_setup, language=C]
+errval_t setup_vspace(struct spawninfo *si) {
+    // Initialize the slot allocator
+    // ... removed code
+    
+    // Step 1: Allocate a slot for the L0 page table
+    //... removed code
+
+    // Step 2: Create the L0 page table for AARCH64
+    err = vnode_create(si->vspace, ObjType_VNode_AARCH64_l0);
+    if (err_is_fail(err)) {
+        // ... handle errors
+    }
+
+    // Step 3: Initialize paging state with the L0 page table
+    err = paging_init_state_foreign(&si->process_paging_state, 0, si->vspace, &si->default_sa.a);
+    if (err_is_fail(err)) {
+        // ... handle errors
+    }
+
+    //... removed code that sets up RAM Capability
+
+    return SYS_ERR_OK;
+}
+\end{lstlisting}
+
+\subsection*{ELF Binary Loading}
+Loading the ELF binary into the child's virtual address space (VSpace) is a critical step in process spawning. The goal is to map program segments to specific virtual addresses as specified in the ELF file's program headers. This involves parsing the ELF file, allocating frames for the segments, and performing the necessary mappings. The steps include:
+
+\begin{itemize}
+    \item \textbf{Parsing the Program Headers:} Each program segment is described in the ELF file's program headers. These headers specify the virtual addresses and sizes of the segments to be loaded into the process's VSpace.
+    \item \textbf{Allocating Frames:} For each segment, a frame is allocated to hold its data. The size of the frame is determined by rounding up the segment's size to the nearest page boundary.
+    \item \textbf{Mapping Frames to VSpace:} The allocated frame is mapped into the child's VSpace at the specified virtual address.
+\end{itemize}
+
+\subsubsection*{Challenges and Solutions}
+\paragraph{Handling VADDR\_OFFSET Issues:} During implementation, we encountered an issue where the virtual address specified in the ELF file was smaller than \texttt{VADDR\_OFFSET}, which was previously assumed to be the smallest virtual address allowed for allocation. This assumption stemmed from the notion that the 1GB offset was reserved for booting. However, further investigation revealed that this reservation only applies to the \texttt{init} process, and the child process is free to allocate memory in the 0–1GB region. To accommodate this, we removed the relevant assertions from M2.
+
+\paragraph{Unaligned Virtual Addresses:} Another challenge was that the specified virtual address for some segments was not aligned to the page size (4KB). This violated the earlier M1 assertion that all allocated physical memory should be aligned to 4KB boundaries. To address this:
+\begin{itemize}
+    \item The base address was adjusted using \texttt{ROUND\_DOWN} to align it with the page size.
+    \item The frame size was increased to include the unaligned portion by adding the offset difference.
+    \item During mapping, the frame was mapped starting at the specified base address, leaving the initial unaligned portion unused.
+\end{itemize}
+This approach minimizes waste, as at most only 4KB of memory is unused.
+
+\begin{lstlisting}[caption={Mapping ELF segments with alignment considerations}, label=lst:elf_mapping, language=C]
+static errval_t elf_allocate(void *state, genvaddr_t base, size_t size, uint32_t flags, void **ret) {
+    struct spawninfo *si = (struct spawninfo *)state;
+
+    // Align base and size to page boundaries
+    genvaddr_t aligned_base = ROUND_DOWN(base, BASE_PAGE_SIZE);
+    size_t aligned_size = ROUND_UP(size + (base - aligned_base), BASE_PAGE_SIZE);
+
+    // Allocate and map the memory
+    // ... removed code
+
+    // Map into the parent's VSpace
+    // ... removed code
+
+    // Map into the child's VSpace
+    // ... removed code
+    
+    *ret = local_addr + (base - aligned_base);
+    return SYS_ERR_OK;
+}
+\end{lstlisting}
+
+\paragraph{Global Offset Table (GOT):} Once the ELF segments are mapped, the Global Offset Table (GOT) is located using ELF section headers. The GOT base address is then used to initialize the dispatcher registers, enabling runtime resolution of global variables and facilitating shared library support.
+
+By addressing these challenges, we ensured that the ELF loader correctly handles real-world binaries, even with complex memory layout requirements.
+
+\subsubsection*{Dispatcher Setup}
+\begin{itemize}
+    \item A dispatcher control block (DCB) is allocated and mapped into both the parent’s and child’s address spaces. 
+    \item The dispatcher is initialized in disabled mode, with fields such as core ID, domain ID, and the program counter set appropriately.
+    \item The \texttt{armv8\_set\_registers} function initializes the GOT base and entry point for the dispatcher.
+\end{itemize}
+
+\begin{lstlisting}[caption={Initializing the dispatcher fields}, label=lst:dispatcher_init, language=C]
+// Access the dispatcher structure fields
+struct dispatcher_shared_generic *disp = get_dispatcher_shared_generic(handle);
+struct dispatcher_generic *disp_gen = get_dispatcher_generic(handle);
+
+// Initialize dispatcher fields
+disp->disabled = 1;                         // Start in disabled mode
+disp_init_disabled(handle);                 // Initialize disabled state
+disp_gen->core_id = disp_get_core_id();     // Set the core ID for the child
+disp_gen->domain_id = domain_id;            // Assign the domain ID
+si->pid = domain_id;                        // Store the domain ID in the spawninfo struct
+\end{lstlisting}
+
+
+\subsubsection*{Argument Passing}
+\begin{itemize}
+    \item  Command-line arguments are parsed and stored in a dedicated arguments frame in the child’s address space.
+    \item  The \texttt{spawn\_domain\_params} structure is populated with pointers to the arguments in the child’s VSpace, ensuring proper alignment and null-termination.
+\end{itemize}
+
+\subsection*{Process Management}
+\subsubsection*{Start, Suspend, Resume, and Kill}
+\begin{itemize}
+    \item Processes are started by invoking their dispatcher capability, transitioning them to the \texttt{RUNNING} state. Every new process gets assigned a PID by the process manager.
+    \item Suspend and resume functionality is implemented by manipulating the dispatcher’s state in the run queue.
+    \item Processes can be terminated (killed) by removing their dispatcher from the run queue and setting their state to \texttt{KILLED}.
+\end{itemize}
+
+
+\subsubsection*{Tracking and Cleanup}
+\begin{itemize}
+    \item A linked-list data structure is used to keep track of processes, storing information such as name, PID, and capabilities.
+    \item Although full cleanup of resources is not yet implemented, the framework is in place to traverse and reclaim allocated resources.
+\end{itemize}
+
+\subsection*{Optimization and Improvements}
+\begin{itemize}
+    \item Implement full cleanup of process resources and automatic updates to the process tracking structure upon termination.
+    \item Improve the PID assignment as it may overwrite the running PIDs if the number gets too large
+\end{itemize}
